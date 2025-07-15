@@ -1,0 +1,28 @@
+{
+  "name": "cybersec-platform",
+  "version": "1.0.0",
+  "description": "AI-Powered Cybersecurity Risk Simulation Web Platform",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently \"cd frontend && npm run dev\" \"cd backend && npm run dev\" \"cd ml-service && uvicorn main:app --reload --port 8001\"",
+    "build": "cd frontend && npm run build && cd ../backend && npm run build",
+    "start": "cd backend && npm start",
+    "test": "npm run test:frontend && npm run test:backend",
+    "test:frontend": "cd frontend && npm test",
+    "test:backend": "cd backend && npm test",
+    "docker:build": "docker-compose build",
+    "docker:up": "docker-compose up",
+    "docker:down": "docker-compose down",
+    "setup": "npm install && cd frontend && npm install && cd ../backend && npm install && cd ../ml-service && pip install -r requirements.txt"
+  },
+  "keywords": ["cybersecurity", "vulnerability", "scanning", "ai", "ml", "risk", "simulation"],
+  "author": "CyberSec Platform Team",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "workspaces": [
+    "frontend",
+    "backend"
+  ]
+}

@@ -1,0 +1,455 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  release:
+    types: [ published ]
+
+env:
+  NODE_VERSION: '18'
+  PYTHON_VERSION: '3.11'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Test frontend
+  test-frontend:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+        
+    - name: Install dependencies
+      run: |
+        cd frontend
+        npm ci
+        
+    - name: Run linting
+      run: |
+        cd frontend
+        npm run lint
+        
+    - name: Run tests
+      run: |
+        cd frontend
+        npm run test:coverage
+        
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./frontend/coverage/lcov.info
+        flags: frontend
+        name: frontend-coverage
+        
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm run build
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: frontend-build
+        path: frontend/dist/
+        retention-days: 1
+
+  # Test backend
+  test-backend:
+    runs-on: ubuntu-latest
+    
+    services:
+      mongodb:
+        image: mongo:7.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: backend/package-lock.json
+        
+    - name: Install dependencies
+      run: |
+        cd backend
+        npm ci
+        
+    - name: Run linting
+      run: |
+        cd backend
+        npm run lint
+        
+    - name: Run tests
+      run: |
+        cd backend
+        npm run test:coverage
+      env:
+        NODE_ENV: test
+        MONGODB_URI: mongodb://localhost:27017/cybersec-test
+        REDIS_URL: redis://localhost:6379
+        JWT_SECRET: test-secret
+        
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./backend/coverage/lcov.info
+        flags: backend
+        name: backend-coverage
+
+  # Test ML service
+  test-ml-service:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+        cache-dependency-path: ml-service/requirements.txt
+        
+    - name: Install dependencies
+      run: |
+        cd ml-service
+        pip install -r requirements.txt
+        
+    - name: Run linting
+      run: |
+        cd ml-service
+        flake8 .
+        black --check .
+        
+    - name: Run tests
+      run: |
+        cd ml-service
+        pytest --cov=. --cov-report=xml
+        
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./ml-service/coverage.xml
+        flags: ml-service
+        name: ml-service-coverage
+
+  # Security scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: [test-frontend, test-backend, test-ml-service]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+    - name: Run Semgrep security scan
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: auto
+        
+    - name: Run npm audit (backend)
+      run: |
+        cd backend
+        npm audit --audit-level=moderate
+        
+    - name: Run npm audit (frontend)
+      run: |
+        cd frontend
+        npm audit --audit-level=moderate
+        
+    - name: Run Safety check (Python)
+      run: |
+        cd ml-service
+        pip install safety
+        safety check
+
+  # Build and push Docker images
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [test-frontend, test-backend, test-ml-service, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      packages: write
+      
+    strategy:
+      matrix:
+        service: [frontend, backend, ml-service]
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./${{ matrix.service }}
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Deploy to staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Deploy to staging
+      run: |
+        echo "Deploying to staging environment..."
+        # Add your staging deployment commands here
+        # Example: kubectl apply -f k8s/staging/
+        
+    - name: Run smoke tests
+      run: |
+        echo "Running smoke tests..."
+        # Add smoke test commands here
+        
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      if: always()
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        
+  # Deploy to production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: github.event_name == 'release' && github.event.action == 'published'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production environment..."
+        # Add your production deployment commands here
+        # Example: kubectl apply -f k8s/production/
+        
+    - name: Run health checks
+      run: |
+        echo "Running health checks..."
+        # Add health check commands here
+        
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      if: always()
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # Performance testing
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Lighthouse CI
+      uses: treosh/lighthouse-ci-action@v10
+      with:
+        configPath: '.lighthouserc.json'
+        uploadArtifacts: true
+        temporaryPublicStorage: true
+        
+    - name: Run load testing
+      run: |
+        echo "Running load tests..."
+        # Add load testing commands here (e.g., k6, Artillery)
+
+  # Database migrations
+  database-migration:
+    runs-on: ubuntu-latest
+    needs: [test-backend]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: backend/package-lock.json
+        
+    - name: Install dependencies
+      run: |
+        cd backend
+        npm ci
+        
+    - name: Run database migrations
+      run: |
+        cd backend
+        npm run migrate
+      env:
+        NODE_ENV: production
+        MONGODB_URI: ${{ secrets.MONGODB_URI }}
+
+  # Cleanup old artifacts
+  cleanup:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [deploy-production, deploy-staging]
+    
+    steps:
+    - name: Delete old packages
+      uses: actions/delete-package-versions@v4
+      with:
+        package-name: ${{ env.IMAGE_NAME }}-frontend
+        package-type: 'container'
+        min-versions-to-keep: 10
+        delete-only-untagged-versions: true
+        
+    - name: Delete old packages
+      uses: actions/delete-package-versions@v4
+      with:
+        package-name: ${{ env.IMAGE_NAME }}-backend
+        package-type: 'container'
+        min-versions-to-keep: 10
+        delete-only-untagged-versions: true
+        
+    - name: Delete old packages
+      uses: actions/delete-package-versions@v4
+      with:
+        package-name: ${{ env.IMAGE_NAME }}-ml-service
+        package-type: 'container'
+        min-versions-to-keep: 10
+        delete-only-untagged-versions: true
+
+  # Generate release notes
+  release-notes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.action == 'published'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Generate release notes
+      uses: release-drafter/release-drafter@v5
+      with:
+        config-name: release-drafter.yml
+        publish: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Dependency updates
+  dependency-update:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Update dependencies
+      uses: dependabot/fetch-metadata@v1
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Auto-merge dependabot PRs
+      uses: pascalgn/merge-action@v0.15.6
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        merge_method: squash
+
+  # Monitor application health
+  health-check:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+    - name: Check application health
+      run: |
+        echo "Checking application health..."
+        # Add health check commands here
+        
+    - name: Notify on failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        channel: '#alerts'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        text: 'Application health check failed!'
